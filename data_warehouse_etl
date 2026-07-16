@@ -1,0 +1,364 @@
+"""
+Sistema Centralizado de Processamento e Análise de Dados (Hospedagem, Locação e Vendas)
+Criador: marinaldosouza@gmail.com
+Compatibilidade: Python 3.12.X e Pandas 2.0+
+"""
+
+__author__ = "marinaldosouza@gmail.com"
+
+import os
+import re
+import json
+import shutil
+import logging
+import tempfile
+import webbrowser
+import urllib.request
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mticker
+
+# =====================================================================
+# CONFIGURAÇÕES GLOBAIS E DIRETÓRIOS
+# =====================================================================
+try:
+    import winreg
+    chave_registro = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+    caminho_area_trabalho_bruto, _ = winreg.QueryValueEx(chave_registro, "Desktop")
+    winreg.CloseKey(chave_registro)
+    CAMINHO_AREA_TRABALHO = Path(os.path.expandvars(caminho_area_trabalho_bruto))
+except Exception:
+    CAMINHO_AREA_TRABALHO = Path.home() / 'Desktop'
+
+DIRETORIO_TRABALHO = CAMINHO_AREA_TRABALHO / 'Python_df'
+DIRETORIO_TRABALHO.mkdir(parents=True, exist_ok=True)
+PASTA_BACKUP = DIRETORIO_TRABALHO / "backups"
+
+FONTES_DADOS = {
+    'hospedagem': "https://cdn3.gnarususercontent.com.br/2928-transformacao-manipulacao-dados/dados_hospedagem.json",
+    'locacao': "https://cdn3.gnarususercontent.com.br/2928-transformacao-manipulacao-dados/dados_locacao_imoveis.json",
+    'vendas': "https://cdn3.gnarususercontent.com.br/2928-transformacao-manipulacao-dados/dados_vendas_clientes.json"
+}
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# =====================================================================
+# MÓDULO 1: EXTRAÇÃO SEGURA E I/O
+# =====================================================================
+def baixar_json_seguro(url: str) -> pd.DataFrame:
+    logging.info(f"Conectando ao servidor para extração...")
+    requisicao = urllib.request.Request(
+        url,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0'}
+    )
+    with urllib.request.urlopen(requisicao) as resposta:
+        dados_json = json.loads(resposta.read().decode('utf-8'))
+    return extrair_dataframe_aninhado(dados_json)
+
+def extrair_dataframe_aninhado(json_obj) -> pd.DataFrame:
+    """Achata a estrutura JSON principal para um formato tabular com explosão em paralelo."""
+    if isinstance(json_obj, list):
+        df = pd.json_normalize(json_obj)
+    elif isinstance(json_obj, dict):
+        for chave, valor in json_obj.items():
+            if isinstance(valor, list) and len(valor) > 0 and isinstance(valor[0], dict):
+                df = pd.json_normalize(valor)
+                break
+        else:
+            df = pd.json_normalize(json_obj)
+    else:
+        raise ValueError("Estrutura JSON não suportada.")
+
+    # PULO DO GATO: Explodir todas as colunas simultaneamente!
+    # Isso alinha os dados e impede o ArrayMemoryError (explosão cartesiana).
+    colunas_explodir = [col for col in df.columns if df[col].apply(lambda x: isinstance(x, list)).any()]
+    if colunas_explodir:
+        df = df.explode(colunas_explodir, ignore_index=True)
+        
+    return df
+
+def gerenciar_backup_e_io(caminho_arquivo: Path, limite=2):
+    if not caminho_arquivo.exists(): return
+    PASTA_BACKUP.mkdir(parents=True, exist_ok=True)
+    carimbo_tempo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_backup = PASTA_BACKUP / f"{caminho_arquivo.stem}_{carimbo_tempo}{caminho_arquivo.suffix}"
+    shutil.copy2(caminho_arquivo, nome_backup)
+    logging.info(f"Backup seguro gerado: {nome_backup.name}")
+    
+    arquivos_backup = sorted(PASTA_BACKUP.glob(f"{caminho_arquivo.stem}_*{caminho_arquivo.suffix}"))
+    if len(arquivos_backup) > limite:
+        for arq in arquivos_backup[:-limite]:
+            arq.unlink(missing_ok=True)
+
+# =====================================================================
+# MÓDULO 2: UTILITÁRIOS E TRANSFORMAÇÕES CORE
+# =====================================================================
+def formatar_valor_moeda(valor) -> str:
+    if pd.isna(valor): return "N/A"
+    return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def extrair_valor_numerico_seguro(valor) -> float:
+    # Agora que explodimos corretamente, podemos simplificar e garantir a limpeza
+    if pd.isna(valor): 
+        return np.nan
+        
+    texto = str(valor)
+    for c in ["['", "']", '["', '"]', '[', ']']: 
+        texto = texto.replace(c, "")
+        
+    texto_limpo = re.sub(r'[^\d.,]', '', texto)
+    if not texto_limpo: 
+        return np.nan
+        
+    if ',' in texto_limpo: 
+        texto_limpo = texto_limpo.replace('.', '').replace(',', '.')
+        
+    try:
+        return float(texto_limpo)
+    except ValueError:
+        return np.nan
+
+def texto_extenso_para_numero(texto):
+    mapa = {
+        'zero': 0, 'um': 1, 'uma': 1, 'dois': 2, 'duas': 2, 'tres': 3, 'três': 3, 'quatro': 4,
+        'cinco': 5, 'seis': 6, 'sete': 7, 'oito': 8, 'nove': 9, 'dez': 10, 'onze': 11, 'doze': 12,
+        'vinte': 20, 'trinta': 30, 'cem': 100, 'cento': 100, 'duzentos': 200, 'mil': 1000
+    }
+    palavras = re.sub(r'[^a-záéíóúãõç\s]', '', str(texto).lower()).split()
+    total = 0; atual = 0
+    for palavra in palavras:
+        if palavra in mapa:
+            if mapa[palavra] == 1000:
+                if atual == 0: atual = 1
+                total += atual * 1000
+                atual = 0
+            else:
+                atual += mapa[palavra]
+    return total + atual if total + atual > 0 else None
+
+def otimizar_memoria(df: pd.DataFrame) -> pd.DataFrame:
+    df_otimizado = df.copy()
+    for col in df_otimizado.select_dtypes(include=['float64']).columns:
+        df_otimizado[col] = pd.to_numeric(df_otimizado[col], downcast='float')
+    for col in df_otimizado.select_dtypes(include=['int64']).columns:
+        df_otimizado[col] = pd.to_numeric(df_otimizado[col].fillna(0), downcast='integer')
+    return df_otimizado
+
+# =====================================================================
+# MÓDULO 3: TRATAMENTOS POR DOMÍNIO
+# =====================================================================
+def tratar_hospedagem(df: pd.DataFrame) -> pd.DataFrame:
+    df_tratado = df.copy()
+    float_cols = ['avaliacao_geral', 'taxa_deposito', 'taxa_limpeza', 'preco']
+    string_cols = ['experiencia_local', 'descricao_local', 'descricao_vizinhanca', 'modelo_cama', 'comodidades']
+
+    for coluna in df_tratado.columns:
+        if coluna in float_cols:
+            df_tratado[coluna] = df_tratado[coluna].apply(extrair_valor_numerico_seguro)
+        elif coluna in string_cols and df_tratado[coluna].dtype == 'object':
+            df_tratado[coluna] = df_tratado[coluna].apply(lambda x: ', '.join(map(str, x)) if isinstance(x, list) else str(x))
+            df_tratado[coluna] = df_tratado[coluna].str.lower().str.replace(r'[^\w\s\',\-\,\.]', '', regex=True).str.strip().astype('string')
+    
+    df_tratado.columns = [col.strip().lower().replace(" ", "_") for col in df_tratado.columns]
+    return otimizar_memoria(df_tratado)
+
+def tratar_locacao(df: pd.DataFrame) -> pd.DataFrame:
+    df_tratado = df.copy()
+    col_pag = next((c for c in df_tratado.columns if re.search(r'datas_de_pagamento', c, re.I)), None)
+    col_venc = next((c for c in df_tratado.columns if re.search(r'datas_combinadas', c, re.I)), None)
+
+    for col in df_tratado.columns:
+        if re.search(r'data|date|dt', col, re.I):
+            df_tratado[col] = pd.to_datetime(df_tratado[col], errors='coerce', dayfirst=True)
+        elif col == 'valor_aluguel':
+            valores = []
+            for val in df_tratado[col].astype(str):
+                num = extrair_valor_numerico_seguro(val)
+                if pd.isna(num): num = texto_extenso_para_numero(val)
+                valores.append(num)
+            df_tratado[col] = valores
+        elif df_tratado[col].dtype == 'object':
+            df_tratado[col] = df_tratado[col].astype(str).str.replace(r'[()]', '', regex=True).str.strip().str.title()
+            
+    if col_pag and col_venc:
+        df_tratado['status_pagamento'] = 'N/A'
+        mascara_validas = df_tratado[col_pag].notna() & df_tratado[col_venc].notna()
+        df_tratado.loc[mascara_validas, 'status_pagamento'] = np.where(
+            df_tratado.loc[mascara_validas, col_pag] <= df_tratado.loc[mascara_validas, col_venc],
+            'Em dia', 'Atrasado'
+        )
+    return otimizar_memoria(df_tratado)
+
+def tratar_vendas(df: pd.DataFrame) -> pd.DataFrame:
+    df_tratado = df.copy()
+    for col in df_tratado.columns:
+        if re.search(r'data|date|dt|venda', col, re.I) and 'Data de Venda' not in df_tratado.columns:
+            df_tratado[col] = pd.to_datetime(df_tratado[col], errors='coerce', dayfirst=True)
+            df_tratado.rename(columns={col: 'Data de Venda'}, inplace=True)
+        elif re.search(r'valor', col, re.I):
+            df_tratado[col] = df_tratado[col].apply(extrair_valor_numerico_seguro)
+        elif col == 'Cliente':
+            df_tratado[col] = df_tratado[col].astype(str).str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
+            df_tratado[col] = df_tratado[col].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.title().str.strip()
+    return otimizar_memoria(df_tratado)
+
+# =====================================================================
+# MÓDULO 4: RELATÓRIOS E VISUALIZAÇÕES CONFIÁVEIS
+# =====================================================================
+def exibir_html(df: pd.DataFrame, titulo="Visão Geral"):
+    # Limitando a exibição no navegador para não travar a tela
+    amostra = df.head(100).to_html(index=False)
+    html = f"""
+    <html><head><style>
+        body {{ background-color: #121212; color: #fff; font-family: sans-serif; padding: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ border: 1px solid #444; padding: 8px; text-align: left; }}
+        th {{ background-color: #333; color: #4db8ff; position: sticky; top: 0; }}
+        tr:nth-child(even) {{ background-color: #1a1a1a; }}
+    </style></head><body><h2>{titulo}</h2>{amostra}</body></html>
+    """
+    caminho = Path(tempfile.gettempdir()) / "preview_dados.html"
+    caminho.write_text(html, encoding='utf-8')
+    webbrowser.open(f"file://{caminho}")
+
+def relatorio_financeiro_locacao(df: pd.DataFrame):
+    print("\n--- VISÃO FINANCEIRA DE LOCAÇÕES ---")
+    if 'status_pagamento' not in df.columns or 'valor_aluguel' not in df.columns:
+        print("[!] Erro: Colunas de valor ou status não foram processadas corretamente.")
+        return
+    
+    df_valido = df.dropna(subset=['valor_aluguel']).copy()
+    df_valido = df_valido[df_valido['status_pagamento'] != 'N/A']
+    
+    total_apts = len(df_valido)
+    total_alugueis = df_valido['valor_aluguel'].sum()
+    
+    for status in ['Em dia', 'Atrasado']:
+        df_status = df_valido[df_valido['status_pagamento'] == status]
+        qtd = len(df_status)
+        soma = df_status['valor_aluguel'].sum()
+        media = df_status['valor_aluguel'].mean() if qtd > 0 else 0
+        porc_qtd = (qtd / total_apts) * 100 if total_apts > 0 else 0
+        porc_valor = (soma / total_alugueis) * 100 if total_alugueis > 0 else 0
+        
+        print(f"\n** Pagamentos {status} **")
+        print(f"Apartamentos: {qtd} ({porc_qtd:.2f}%)")
+        print(f"Soma Arrecadada: {formatar_valor_moeda(soma)}")
+        print(f"Média: {formatar_valor_moeda(media)} | Representação do Total: {porc_valor:.2f}%")
+
+def ranking_clientes_vendas(df: pd.DataFrame):
+    print("\n--- RANKING ESTATÍSTICO POR CLIENTE ---")
+    if 'Cliente' not in df.columns or 'Valor da compra' not in df.columns:
+        print("[!] Erro: Colunas essenciais ausentes.")
+        return
+        
+    estatisticas = df.groupby('Cliente', as_index=False).agg(
+        Qtd_Compras=('Valor da compra', 'count'),
+        Gasto_Total=('Valor da compra', 'sum')
+    )
+    total_compras = estatisticas['Qtd_Compras'].sum()
+    estatisticas['%'] = (estatisticas['Qtd_Compras'] / total_compras * 100).apply(lambda x: f"{x:.2f}%")
+    estatisticas['Gasto_Total'] = estatisticas['Gasto_Total'].apply(formatar_valor_moeda)
+    estatisticas = estatisticas.sort_values('Qtd_Compras', ascending=False)
+    
+    print(estatisticas.to_string(index=False))
+
+def grafico_evolucao_vendas(df: pd.DataFrame):
+    if 'Data de Venda' not in df.columns or 'Valor da compra' not in df.columns:
+        print("[!] Colunas necessárias não encontradas para o gráfico.")
+        return
+    df_agrupado = df.groupby('Data de Venda')['Valor da compra'].sum().reset_index()
+    plt.figure(figsize=(12, 6))
+    sns.lineplot(data=df_agrupado, x='Data de Venda', y='Valor da compra', marker='o', color='b')
+    plt.title("Evolução de Vendas ao Longo do Tempo")
+    plt.gca().yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: formatar_valor_moeda(x)))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# =====================================================================
+# MÓDULO 5: ORQUESTRAÇÃO E MENUS
+# =====================================================================
+def processar_fluxo(tipo: str) -> pd.DataFrame:
+    url = FONTES_DADOS[tipo]
+    extensao = ".parquet" if tipo == 'hospedagem' else ".csv"
+    caminho_local = DIRETORIO_TRABALHO / f"df_processado_{tipo}{extensao}"
+    
+    if caminho_local.exists():
+        if input(f"Arquivo local de {tipo.upper()} detectado. Deseja forçar atualização online? (s/n): ").strip().lower() != 's':
+            df = pd.read_parquet(caminho_local) if extensao == '.parquet' else pd.read_csv(caminho_local)
+            print(f"\n[OK] Arquivo carregado do disco ({len(df)} linhas).")
+            return df
+        gerenciar_backup_e_io(caminho_local)
+
+    df_bruto = baixar_json_seguro(url)
+    
+    if tipo == 'hospedagem': df_final = tratar_hospedagem(df_bruto)
+    elif tipo == 'locacao': df_final = tratar_locacao(df_bruto)
+    elif tipo == 'vendas': df_final = tratar_vendas(df_bruto)
+
+    if extensao == '.parquet': df_final.to_parquet(caminho_local, index=False)
+    else: df_final.to_csv(caminho_local, index=False)
+    
+    print(f"\n[OK] Dados extraídos e otimizados com sucesso!")
+    return df_final
+
+def menu_analise_locacao(df: pd.DataFrame):
+    while True:
+        print("\n--- ANÁLISE DE LOCAÇÕES ---")
+        print("1 - Visualizar DataFrame (Navegador HTML)")
+        print("2 - Relatório Financeiro de Pagamentos (Terminal)")
+        print("0 - Voltar ao Menu Principal")
+        opc = input("Escolha a análise: ").strip()
+        if opc == '1': exibir_html(df, "Dados de Locação de Imóveis")
+        elif opc == '2': relatorio_financeiro_locacao(df)
+        elif opc == '0': break
+        else: print("Opção inválida.")
+
+def menu_analise_vendas(df: pd.DataFrame):
+    while True:
+        print("\n--- ANÁLISE DE VENDAS ---")
+        print("1 - Visualizar DataFrame (Navegador HTML)")
+        print("2 - Ranking de Gasto por Cliente (Terminal)")
+        print("3 - Gráfico de Evolução de Vendas")
+        print("0 - Voltar ao Menu Principal")
+        opc = input("Escolha a análise: ").strip()
+        if opc == '1': exibir_html(df, "Dados de Vendas e Clientes")
+        elif opc == '2': ranking_clientes_vendas(df)
+        elif opc == '3': grafico_evolucao_vendas(df)
+        elif opc == '0': break
+        else: print("Opção inválida.")
+
+def menu_principal():
+    while True:
+        print("\n" + "="*40)
+        print("  DATA WAREHOUSE CENTRAL - ETLS")
+        print("="*40)
+        print("1 - Processar & Analisar: Hospedagem")
+        print("2 - Processar & Analisar: Locação de Imóveis")
+        print("3 - Processar & Analisar: Vendas de Clientes")
+        print("0 - Sair do Sistema")
+        
+        opcao = input("\nSelecione o pipeline de dados: ").strip()
+        
+        if opcao == '0':
+            print("Encerrando operações. Até a próxima!")
+            break
+        elif opcao == '1':
+            df = processar_fluxo('hospedagem')
+            exibir_html(df, "Dados de Hospedagem")
+        elif opcao == '2':
+            df = processar_fluxo('locacao')
+            menu_analise_locacao(df)
+        elif opcao == '3':
+            df = processar_fluxo('vendas')
+            menu_analise_vendas(df)
+        else:
+            print("Opção inválida.")
+
+if __name__ == "__main__":
+    menu_principal()
